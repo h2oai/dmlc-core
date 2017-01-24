@@ -37,6 +37,14 @@
 #define DMLC_LOG_CUSTOMIZE 0
 #endif
 
+/*!
+ * \brief Wheter to print stack trace for fatal error,
+ * enabled on linux when using gcc.
+ */
+#if (!defined(DMLC_LOG_STACK_TRACE) && defined(__GNUC__) && !defined(__MINGW32__))
+#define DMLC_LOG_STACK_TRACE 1
+#endif
+
 /*! \brief whether compile with hdfs support */
 #ifndef DMLC_USE_HDFS
 #define DMLC_USE_HDFS 0
@@ -61,6 +69,11 @@
 /*! \brief strict CXX11 support */
 #ifndef DMLC_STRICT_CXX11
 #define DMLC_STRICT_CXX11 (__cplusplus >= 201103L || defined(_MSC_VER))
+#endif
+
+/*! \brief whether RTTI is enabled */
+#ifndef DMLC_ENABLE_RTTI
+#define DMLC_ENABLE_RTTI 1
 #endif
 
 /// check if g++ is before 4.6

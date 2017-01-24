@@ -22,6 +22,7 @@
 #include "./json.h"
 #include "./logging.h"
 #include "./type_traits.h"
+#include "./optional.h"
 
 namespace dmlc {
 // this file is backward compatible with non-c++11
@@ -63,7 +64,9 @@ enum ParamInitOption {
   /*! \brief allow unknown parameters */
   kAllowUnknown,
   /*! \brief need to match exact parameters */
-  kAllMatch
+  kAllMatch,
+  /*! \brief allow unmatched hidden field with format __*__ */
+  kAllowHidden
 };
 }  // namespace parameter
 /*!
@@ -122,11 +125,11 @@ struct Parameter {
    */
   template<typename Container>
   inline void Init(const Container &kwargs,
-                   parameter::ParamInitOption option = parameter::kAllowUnknown) {
+                   parameter::ParamInitOption option = parameter::kAllowHidden) {
     PType::__MANAGER__()->RunInit(static_cast<PType*>(this),
                                   kwargs.begin(), kwargs.end(),
                                   NULL,
-                                  option == parameter::kAllowUnknown);
+                                  option);
   }
   /*!
    * \brief initialize the parameter by keyword arguments.
@@ -143,7 +146,7 @@ struct Parameter {
     std::vector<std::pair<std::string, std::string> > unknown;
     PType::__MANAGER__()->RunInit(static_cast<PType*>(this),
                                   kwargs.begin(), kwargs.end(),
-                                  &unknown, true);
+                                  &unknown, parameter::kAllowUnknown);
     return unknown;
   }
   /*!
@@ -332,8 +335,8 @@ class FieldAccessEntry {
 };
 
 /*!
- * \brief manager class to handle parameter setting for each type
- *  An manager will be created for each parameter types.
+ * \brief manager class to handle parameter structure for each type
+ *  An manager will be created for each parameter structure.
  */
 class ParamManager {
  public:
@@ -369,7 +372,7 @@ class ParamManager {
                       RandomAccessIterator begin,
                       RandomAccessIterator end,
                       std::vector<std::pair<std::string, std::string> > *unknown_args,
-                      bool allow_unknown) const {
+                      parameter::ParamInitOption option) const {
     std::set<FieldAccessEntry*> selected_args;
     for (RandomAccessIterator it = begin; it != end; ++it) {
       FieldAccessEntry *e = Find(it->first);
@@ -381,7 +384,13 @@ class ParamManager {
         if (unknown_args != NULL) {
           unknown_args->push_back(*it);
         } else {
-          if (!allow_unknown) {
+          if (option != parameter::kAllowUnknown) {
+            if (option == parameter::kAllowHidden &&
+                it->first.length() > 4 &&
+                it->first.find("__") == 0 &&
+                it->first.rfind("__") == it->first.length()-2) {
+              continue;
+            }
             std::ostringstream os;
             os << "Cannot find argument \'" << it->first << "\', Possible Arguments:\n";
             os << "----------------\n";
@@ -480,7 +489,7 @@ class ParamManager {
   std::string name_;
   /*! \brief positional list of entries */
   std::vector<FieldAccessEntry*> entry_;
-  /*! \brief map of key to entry */
+  /*! \brief map from key to entry */
   std::map<std::string, FieldAccessEntry*> entry_map_;
 };
 
@@ -632,18 +641,18 @@ class FieldEntryNumeric
     if (has_begin_ && has_end_) {
       if (v < begin_ || v > end_) {
         std::ostringstream os;
-        os << "value " << v << "for Parameter " << this->key_
+        os << "value " << v << " for Parameter " << this->key_
            << " exceed bound [" << begin_ << ',' << end_ <<']';
         throw dmlc::ParamError(os.str());
       }
     } else if (has_begin_ && v < begin_) {
         std::ostringstream os;
-        os << "value " << v << "for Parameter " << this->key_
+        os << "value " << v << " for Parameter " << this->key_
            << " should be greater equal to " << begin_;
         throw dmlc::ParamError(os.str());
     } else if (has_end_ && v > end_) {
         std::ostringstream os;
-        os << "value " << v << "for Parameter " << this->key_
+        os << "value " << v << " for Parameter " << this->key_
            << " should be smaller equal to " << end_;
         throw dmlc::ParamError(os.str());
     }
@@ -750,7 +759,7 @@ class FieldEntry<int>
   // override print default
   virtual void PrintValue(std::ostream &os, int value) const {  // NOLINT(*)
     if (is_enum_) {
-      CHECK_NE(enum_back_map_.count(value), 0)
+      CHECK_NE(enum_back_map_.count(value), 0U)
           << "Value not found in enum declared";
       os << enum_back_map_.at(value);
     } else {
@@ -767,6 +776,115 @@ class FieldEntry<int>
       if (it != enum_map_.begin()) {
         os << ", ";
       }
+      os << "\'" << it->first << '\'';
+    }
+    os << '}';
+  }
+};
+
+
+// specialize define for optional<int>(enum)
+template<>
+class FieldEntry<optional<int> >
+    : public FieldEntryBase<FieldEntry<optional<int> >, optional<int> > {
+ public:
+  // construct
+  FieldEntry<optional<int> >() : is_enum_(false) {}
+  // parent
+  typedef FieldEntryBase<FieldEntry<optional<int> >, optional<int> > Parent;
+  // override set
+  virtual void Set(void *head, const std::string &value) const {
+    if (is_enum_ && value != "None") {
+      std::map<std::string, int>::const_iterator it = enum_map_.find(value);
+      std::ostringstream os;
+      if (it == enum_map_.end()) {
+        os << "Invalid Input: \'" << value;
+        os << "\', valid values are: ";
+        PrintEnums(os);
+        throw dmlc::ParamError(os.str());
+      } else {
+        os << it->second;
+        Parent::Set(head, os.str());
+      }
+    } else {
+      Parent::Set(head, value);
+    }
+  }
+  virtual ParamFieldInfo GetFieldInfo() const {
+    if (is_enum_) {
+      ParamFieldInfo info;
+      std::ostringstream os;
+      info.name = key_;
+      info.type = type_;
+      PrintEnums(os);
+      if (has_default_) {
+        os << ',' << "optional, default=";
+        PrintDefaultValueString(os);
+      } else {
+        os << ", required";
+      }
+      info.type_info_str = os.str();
+      info.description = description_;
+      return info;
+    } else {
+      return Parent::GetFieldInfo();
+    }
+  }
+  // add enum
+  inline FieldEntry<optional<int> > &add_enum(const std::string &key, int value) {
+    CHECK_NE(key, "None") << "None is reserved for empty optional<int>";
+    if ((enum_map_.size() != 0 && enum_map_.count(key) != 0) || \
+        enum_back_map_.count(value) != 0) {
+      std::ostringstream os;
+      os << "Enum " << "(" << key << ": " << value << " exisit!" << ")\n";
+      os << "Enums: ";
+      for (std::map<std::string, int>::const_iterator it = enum_map_.begin();
+           it != enum_map_.end(); ++it) {
+        os << "(" << it->first << ": " << it->second << "), ";
+      }
+      throw dmlc::ParamError(os.str());
+    }
+    enum_map_[key] = value;
+    enum_back_map_[value] = key;
+    is_enum_ = true;
+    return this->self();
+  }
+
+ protected:
+  // enum flag
+  bool is_enum_;
+  // enum map
+  std::map<std::string, int> enum_map_;
+  // enum map
+  std::map<int, std::string> enum_back_map_;
+  // override print behavior
+  virtual void PrintDefaultValueString(std::ostream &os) const { // NOLINT(*)
+    os << '\'';
+    PrintValue(os, default_value_);
+    os << '\'';
+  }
+  // override print default
+  virtual void PrintValue(std::ostream &os, optional<int> value) const {  // NOLINT(*)
+    if (is_enum_) {
+      if (!value) {
+        os << "None";
+      } else {
+        CHECK_NE(enum_back_map_.count(value.value()), 0U)
+            << "Value not found in enum declared";
+        os << enum_back_map_.at(value.value());
+      }
+    } else {
+      os << value;
+    }
+  }
+
+
+ private:
+  inline void PrintEnums(std::ostream &os) const {  // NOLINT(*)
+    os << "{None";
+    for (std::map<std::string, int>::const_iterator
+             it = enum_map_.begin(); it != enum_map_.end(); ++it) {
+      os << ", ";
       os << "\'" << it->first << '\'';
     }
     os << '}';
